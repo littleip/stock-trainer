@@ -29,22 +29,22 @@ import numpy as np
 from tdx_reader import TongdaxinData, calculate_rsi
 
 
-# ============================================================
-# 固定窗口大小（一屏显示的K线根数）
-# ============================================================
-WINDOW_SIZE = 120
+# 窗口大小从 config.yaml 的 display_window 读取，运行时动态获取
 
 
 class KLineChart(FigureCanvas):
-    """K线图组件 - 通达信风格滑动窗口"""
+    """K线图组件 - 通达信风格滑动窗口 + 鼠标拖动 + 十字线"""
 
     def __init__(self, parent=None, width=14, height=9):
         self.fig = Figure(figsize=(width, height), dpi=100, facecolor='#1a1a2e')
         super().__init__(self.fig)
         self.setParent(parent)
+        self._axes_list = []
+        self._n = 0
 
     def plot_data(self, all_data, window_start, window_end, rsi_values,
-                  buy_ops=None, sell_ops=None, stock_code=''):
+                  buy_ops=None, sell_ops=None, stock_code='',
+                  current_idx=None):
         """
         绘制固定窗口的K线图
 
@@ -52,8 +52,12 @@ class KLineChart(FigureCanvas):
         window_start, window_end: 显示窗口的起止索引（闭区间）
         rsi_values: 全部RSI值 list
         buy_ops/sell_ops: 买卖操作记录 list of dict (含 idx 字段)
+        current_idx: 当前训练位置索引（提前结束时用于区分历史/未来K线）
+        show_close_line: 是否在收盘价处画水平参考线
         """
         self.fig.clear()
+
+        self._n = 0
 
         # 配色
         bg_color = '#1a1a2e'
@@ -63,6 +67,9 @@ class KLineChart(FigureCanvas):
         down_color = '#26a69a'   # 绿跌
         ma5_color = '#ffeb3b'    # 黄色 MA5
         ma20_color = '#2196f3'   # 蓝色 MA20
+        limit_up_color = '#e6a817'    # 涨停 土黄色
+        limit_down_color = '#005f00'  # 跌停 深绿色
+        future_alpha = 0.4  # 未来K线透明度
 
         # 三个子图比例 5:1:1
         gs = self.fig.add_gridspec(3, 1, height_ratios=[5, 1, 1], hspace=0.05,
@@ -70,8 +77,9 @@ class KLineChart(FigureCanvas):
         ax_kline = self.fig.add_subplot(gs[0])
         ax_vol = self.fig.add_subplot(gs[1], sharex=ax_kline)
         ax_rsi = self.fig.add_subplot(gs[2], sharex=ax_kline)
+        self._axes_list = [ax_kline, ax_vol, ax_rsi]
 
-        for ax in [ax_kline, ax_vol, ax_rsi]:
+        for ax in self._axes_list:
             ax.set_facecolor(bg_color)
             ax.tick_params(colors=text_color, labelsize=8)
             ax.grid(True, color=grid_color, alpha=0.5, linewidth=0.5)
@@ -81,16 +89,35 @@ class KLineChart(FigureCanvas):
         # 窗口内的数据
         w_data = all_data[window_start:window_end + 1]
         n = len(w_data)
+        self._n = n
         x = np.arange(n)
 
         # ---- K线（蜡烛图）----
         for i in range(n):
             d = w_data[i]
             o, h, l, c = d['open'], d['high'], d['low'], d['close']
+            global_idx = window_start + i
             color = up_color if c >= o else down_color
+            alpha = 1.0
+
+            # 涨跌停检测（对比前一日收盘价）
+            if global_idx > 0:
+                prev_close = all_data[global_idx - 1]['close']
+                if prev_close > 0:
+                    change_pct = (c - prev_close) / prev_close
+                    # 涨停：涨幅>=9.9% 且不是一字板（open!=close 或 high!=low）
+                    is_yizi = (o == h == l == c)
+                    if change_pct >= 0.099 and not is_yizi:
+                        color = limit_up_color
+                    elif change_pct <= -0.099 and not is_yizi:
+                        color = limit_down_color
+
+            # 提前结束：未来K线半透明
+            if current_idx is not None and global_idx > current_idx:
+                alpha = future_alpha
 
             # 影线（细线）
-            ax_kline.vlines(i, l, h, color=color, linewidth=0.8)
+            ax_kline.vlines(i, l, h, color=color, linewidth=0.8, alpha=alpha)
 
             # 实体（矩形）
             body_bottom = min(o, c)
@@ -99,7 +126,7 @@ class KLineChart(FigureCanvas):
                 body_height = (h - l) * 0.01  # 十字星也画一点
             rect = matplotlib.patches.Rectangle(
                 (i - 0.3, body_bottom), 0.6, body_height,
-                linewidth=0.5, edgecolor=color, facecolor=color
+                linewidth=0.5, edgecolor=color, facecolor=color, alpha=alpha
             )
             ax_kline.add_patch(rect)
 
@@ -141,6 +168,16 @@ class KLineChart(FigureCanvas):
         ax_kline.legend(loc='upper left', fontsize=8, facecolor=bg_color,
                        edgecolor=grid_color, labelcolor=text_color)
 
+        # ---- 收盘价水平参考线（当前K线价位标注）----
+        if current_idx is not None:
+            close_x = current_idx - window_start
+            if 0 <= close_x < n:
+                close_price = w_data[close_x]['close']
+                ax_kline.axhline(y=close_price, color='#ffffff', linewidth=0.6,
+                                 linestyle='--', alpha=0.25)
+                ax_kline.text(n - 1, close_price, f' {close_price:.2f}',
+                             fontsize=7, color='#aaaaaa', va='center', ha='left')
+
         # ---- 标记买卖点 ----
         if buy_ops:
             for op in buy_ops:
@@ -170,8 +207,10 @@ class KLineChart(FigureCanvas):
         # ---- 成交量 ----
         for i in range(n):
             d = w_data[i]
+            global_idx = window_start + i
             color = up_color if d['close'] >= d['open'] else down_color
-            ax_vol.bar(i, d['volume'], color=color, width=0.6, alpha=0.8)
+            bar_alpha = future_alpha if (current_idx is not None and global_idx > current_idx) else 0.8
+            ax_vol.bar(i, d['volume'], color=color, width=0.6, alpha=bar_alpha)
 
         ax_vol.set_ylabel('量', fontsize=9, color=text_color)
         # 只显示最高量的标签，避免拥挤
@@ -209,7 +248,6 @@ class KLineChart(FigureCanvas):
             label.set_visible(False)
 
         self.draw()
-
 
 class ReasonDialog(QDialog):
     """
@@ -314,6 +352,9 @@ class ReasonDialog(QDialog):
             if key == Qt.Key_Down:
                 if current_row < self.list_widget.count() - 1:
                     self.list_widget.setCurrentRow(current_row + 1)
+                else:
+                    # 已到最后一个选项，自动跳到确定按钮
+                    self.btn_ok.setFocus()
                 return True
 
             if key == Qt.Key_Space:
@@ -328,6 +369,11 @@ class ReasonDialog(QDialog):
                 # 自动下移
                 if current_row < self.list_widget.count() - 1:
                     self.list_widget.setCurrentRow(current_row + 1)
+                return True
+
+            if key == Qt.Key_Right:
+                # → 快速跳到确定按钮
+                self.btn_ok.setFocus()
                 return True
 
             if key == Qt.Key_Tab:
@@ -348,7 +394,7 @@ class ReasonDialog(QDialog):
             if key in (Qt.Key_Space, Qt.Key_Return, Qt.Key_Enter):
                 self._do_confirm()
                 return
-            if key == Qt.Key_Tab:
+            if key in (Qt.Key_Tab, Qt.Key_Left):
                 self.list_widget.setFocus()
                 return
             if key == Qt.Key_Escape:
@@ -391,13 +437,19 @@ class TrainingSession:
         self.position = None
         self.finished = False
 
-    def get_history_start(self):
-        """获取显示窗口起始位置（包含历史数据）"""
-        return max(0, self.current_idx - WINDOW_SIZE + 1)
-
-    def get_history_end(self):
-        """获取显示窗口结束位置"""
-        return self.current_idx
+    def get_display_range(self, display_window):
+        """
+        训练中：固定 display_window 根K线，末端=current_idx
+        训练后：显示从起点到终点的全部K线（display_window + train_days）
+        """
+        if self.finished:
+            # 从第一根展示的K线到训练最后一根
+            win_start = max(0, self.start_idx - display_window)
+            win_end = self.end_idx
+        else:
+            win_end = self.current_idx
+            win_start = max(0, win_end - display_window + 1)
+        return win_start, win_end
 
     def move_next(self):
         if self.current_idx < self.end_idx:
@@ -791,6 +843,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, '错误', '没有可用的股票数据，请检查通达信目录设置')
             return
 
+        self.current_session = None  # 清理旧session
+
         stock_code = random.choice(self.stock_list)
         try:
             data = self.tdx_data.read_day_file(stock_code)
@@ -799,8 +853,9 @@ class MainWindow(QMainWindow):
             return
 
         train_days = self.spin_days.value()
-        # 需要至少 WINDOW_SIZE 根历史数据 + train_days
-        min_start = WINDOW_SIZE
+        display_window = self.config.get('display_window', 120)
+        # 需要至少 display_window 根历史数据
+        min_start = display_window
         max_start = len(data) - train_days - 1
 
         if max_start <= min_start:
@@ -846,7 +901,7 @@ class MainWindow(QMainWindow):
         self.label_price.setText(f"收盘: {cur['close']:.2f}")
         self.label_progress.setText(f"进度: {s.current_idx - s.start_idx + 1}/{s.end_idx - s.start_idx + 1}")
 
-        # RSI
+        # RSI（当前值，给信息栏用）
         closes_for_rsi = [d['close'] for d in s.data[:s.current_idx + 1]]
         rsi_all = calculate_rsi(closes_for_rsi, self.config.get('rsi_period', 6))
         current_rsi = rsi_all[-1] if rsi_all and rsi_all[-1] is not None else 0
@@ -863,20 +918,18 @@ class MainWindow(QMainWindow):
             self.label_position.setText("持仓: 空仓")
             self.label_position.setStyleSheet("QLabel { color: #888; }")
 
-        # 全量RSI（给图表用）
-        all_closes = [d['close'] for d in s.data[:s.end_idx + 1]]
+        # 固定窗口
+        dw = self.config.get('display_window', 120)
+        win_start, win_end = s.get_display_range(dw)
+        all_closes = [d['close'] for d in s.data[:win_end + 1]]
         rsi_full = calculate_rsi(all_closes, self.config.get('rsi_period', 6))
-
-        # 买卖操作
         buy_ops = [o for o in s.operations if o['action'] == 'buy']
         sell_ops = [o for o in s.operations if o['action'] == 'sell']
 
-        # 绘图（滑动窗口）
-        win_start = s.get_history_start()
-        win_end = s.get_history_end()
         self.chart.plot_data(
             s.data, win_start, win_end, rsi_full,
-            buy_ops, sell_ops, s.stock_code
+            buy_ops, sell_ops, s.stock_code,
+            current_idx=s.current_idx
         )
 
     def on_prev_day(self):
@@ -904,6 +957,17 @@ class MainWindow(QMainWindow):
     def on_buy(self):
         if not self.current_session:
             return
+        s = self.current_session
+        if s.position is not None:
+            self.log("⚠ 已持仓，不能重复买入")
+            return
+        # T+1：卖出当天不能再买入
+        if s.operations and s.operations[-1]['action'] == 'sell':
+            last_sell_date = s.operations[-1]['date']
+            today = s.data[s.current_idx]['date'].strftime('%Y-%m-%d')
+            if last_sell_date == today:
+                self.log("⚠ T+1规则：卖出当天不能买入")
+                return
         reasons = self.config.get('buy_reasons', ['RSI超卖', '放量上涨', '直觉盘感'])
         dlg = ReasonDialog('选择买入理由', reasons, self)
         if dlg.exec_() == QDialog.Accepted:
@@ -920,6 +984,15 @@ class MainWindow(QMainWindow):
 
     def on_sell(self):
         if not self.current_session:
+            return
+        s = self.current_session
+        if s.position is None:
+            self.log("⚠ 当前空仓，不能卖出")
+            return
+        # T+1：买入当天不能卖出
+        today = s.data[s.current_idx]['date'].strftime('%Y-%m-%d')
+        if s.position['entry_date'].strftime('%Y-%m-%d') == today:
+            self.log("⚠ T+1规则：买入当天不能卖出")
             return
         reasons = self.config.get('sell_reasons', ['RSI超买', '触及压力位', '直觉盘感'])
         dlg = ReasonDialog('选择卖出理由', reasons, self)
@@ -944,7 +1017,24 @@ class MainWindow(QMainWindow):
         if not self.current_session:
             return
 
-        result = self.current_session.get_result()
+        # 如果还有持仓，按当前收盘价自动卖出
+        s = self.current_session
+        if s.position is not None:
+            cur = s.data[s.current_idx]
+            price = cur['close']
+            profit_pct = (price - s.position['entry_price']) / s.position['entry_price'] * 100
+            s.operations.append({
+                'action': 'sell',
+                'idx': s.current_idx,
+                'date': cur['date'].strftime('%Y-%m-%d'),
+                'price': price,
+                'reason': '训练结束自动平仓',
+                'profit_pct': round(profit_pct, 2)
+            })
+            s.position = None
+            self.log(f"▼ 训练结束自动平仓 | 价格: {price:.2f} 盈亏: {profit_pct:+.2f}%")
+
+        result = s.get_result()
         self.training_history.append(result)
 
         # 保存到统一JSON文件
@@ -971,7 +1061,13 @@ class MainWindow(QMainWindow):
                     self.btn_buy, self.btn_sell, self.btn_prev]:
             btn.setEnabled(False)
 
-        self.current_session = None
+        # 快速逐条显示剩余K线直到最后一天
+        while s.current_idx < s.end_idx:
+            s.current_idx += 1
+        s.finished = True
+
+        # 刷新显示（展示全部K线）
+        self.update_display()
 
     def save_all_records(self):
         """所有训练记录保存到一个JSON文件"""
