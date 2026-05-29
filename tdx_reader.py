@@ -41,23 +41,25 @@ class TongdaxinData:
     def _detect_price_divisor(self, raw_records):
         """
         自动检测价格除数。
-        通达信不同版本价格倍数不同：100、1000、10000
-        策略：找一个收盘价在合理范围(1~50000)的记录来推断
+        通达信不同版本价格倍数不同：1（已是真实价格）、100、1000
+        策略：对多种除数评分，选最优
         """
-        for rec in raw_records[:100]:
+        samples = []
+        for rec in raw_records[:200]:
             _, _, _, _, close_p, _, _, _ = rec
-            if close_p <= 0:
-                continue
-            # 合理股价范围 1~50000
-            if 1 <= close_p <= 50000:
-                return 1       # 已经是真实价格
-            elif 100 <= close_p <= 5000000:
-                return 100
-            elif 10000 <= close_p <= 500000000:
-                return 1000
-            elif 100000 <= close_p <= 5000000000:
-                return 10000
-        return 100  # 默认
+            if close_p > 0:
+                samples.append(close_p)
+        if not samples:
+            return 100
+
+        best_divisor = 100
+        best_score = -1
+        for divisor in (1, 10, 100, 1000):
+            score = sum(1 for v in samples if 1 <= v / divisor <= 2000)
+            if score > best_score:
+                best_score = score
+                best_divisor = divisor
+        return best_divisor
 
     def read_day_file(self, stock_code: str) -> list:
         """读取单只股票的日线数据"""
@@ -71,43 +73,37 @@ class TongdaxinData:
         if not file_path.exists():
             raise FileNotFoundError(f"数据文件不存在: {file_path}")
 
-        # 先读取所有原始记录
-        raw_records = []
+        records = []
         with open(file_path, 'rb') as f:
             while True:
                 data = f.read(self.RECORD_SIZE)
                 if len(data) < self.RECORD_SIZE:
                     break
                 unpacked = struct.unpack(self.RECORD_FORMAT, data)
-                raw_records.append(unpacked)
 
-        # 自动检测价格除数
-        divisor = self._detect_price_divisor(raw_records)
+                date_int, open_p, high_p, low_p, close_p, amount, volume, _ = unpacked
 
-        records = []
-        for unpacked in raw_records:
-            date_int, open_p, high_p, low_p, close_p, amount, volume, _ = unpacked
+                date_str = str(date_int)
+                try:
+                    date = datetime.strptime(date_str, '%Y%m%d')
+                except:
+                    continue
 
-            date_str = str(date_int)
-            try:
-                date = datetime.strptime(date_str, '%Y%m%d')
-            except:
-                continue
+                # 过滤无效数据
+                if close_p <= 0 or volume <= 0:
+                    continue
 
-            # 过滤无效数据
-            if close_p <= 0 or volume <= 0:
-                continue
-
-            record = {
-                'date': date,
-                'open': open_p / divisor,
-                'high': high_p / divisor,
-                'low': low_p / divisor,
-                'close': close_p / divisor,
-                'amount': amount,
-                'volume': volume
-            }
-            records.append(record)
+                # 通达信数据价格统一除以100
+                record = {
+                    'date': date,
+                    'open': open_p / 100,
+                    'high': high_p / 100,
+                    'low': low_p / 100,
+                    'close': close_p / 100,
+                    'amount': amount,
+                    'volume': volume
+                }
+                records.append(record)
 
         return records
 
